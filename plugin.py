@@ -318,7 +318,7 @@ class BegPlugin(MaiBotPlugin):
         self._ledger_path = Path(self.ctx.paths.data_dir) / "ledger.json"
         self._ledger_path.parent.mkdir(parents=True, exist_ok=True)
         self._load_ledger()
-        total = sum(float(r.get("amount") or 0) for r in self._ledger)
+        total = sum(self._amount_of(r) for r in self._ledger)
         self.ctx.logger.info(
             "账本已加载：%d 笔，累计 %.2f 元，文件=%s",
             len(self._ledger),
@@ -337,6 +337,10 @@ class BegPlugin(MaiBotPlugin):
         )
 
     async def on_unload(self) -> None:
+        # 道谢任务跑在后台，卸载后 ctx 已经失效，先取消掉再清表
+        for task in list(self._bg_tasks):
+            task.cancel()
+        self._bg_tasks.clear()
         self._last_sent.clear()
         self._daily.clear()
         self._pending.clear()
@@ -552,17 +556,25 @@ class BegPlugin(MaiBotPlugin):
             await self._reply(stream_id, text)
             return False, text, 1
 
-        self._approvals.pop(rec["id"], None)
-        self._save_approvals()
         unit = self.config.ledger.currency
 
         if not approve:
+            self._approvals.pop(rec["id"], None)
+            self._save_approvals()
             text = f"好，#{rec['id']} 那笔 {rec['amount']:.2f}{unit} 不记了。"
             await self._reply(stream_id, text)
             self.ctx.logger.info("记账被拒 #%s", rec["id"])
             return True, text, 1
 
+        # 先落账再删待确认：账本写不进去的话，这条记录还得留着让管理员重试
         entry = self._record_payment(rec["amount"], rec["note"], rec["stream_id"])
+        if entry is None:
+            text = "账本写不进去，这笔还没记上，待确认记录给你留着。"
+            await self._reply(stream_id, text)
+            return False, text, 1
+
+        self._approvals.pop(rec["id"], None)
+        self._save_approvals()
         text = f"记上了 #{rec['id']}，{rec['amount']:.2f}{unit}。"
         # 道谢要发回原来的群，不是管理员私聊
         if await self._fire_thanks(
@@ -790,11 +802,13 @@ class BegPlugin(MaiBotPlugin):
                 if isinstance(gi, dict):
                     group = str(gi.get("group_name") or "").strip()
 
-        # 工具路径没有 message，只能拿注入的 chat_id 当群标识，至少让管理员知道是哪个群
+        # 工具路径没有 message，只能拿注入的 chat_id 当群标识，至少让管理员知道是哪个群。
+        # ⚠ 只有纯数字才可能是群号：私聊的 chat_id 是一串 UUID，拿它拼「群 xxx」
+        # 会让管理员以为这笔发生在某个群里。
         if not group:
             chat_id = str(kwargs.get("chat_id") or "").strip()
             uid = str(kwargs.get("user_id") or "").strip()
-            if chat_id and chat_id != uid:
+            if chat_id.isdigit() and chat_id != uid:
                 group = f"群 {chat_id}"
 
         return self._caller_id(kwargs), name, group
@@ -835,6 +849,21 @@ class BegPlugin(MaiBotPlugin):
             await self.ctx.send.text(text, stream_id)
         except Exception as exc:
             self.ctx.logger.error("发送命令响应失败: %s", exc)
+
+    def _prune_state(self, now: float, today: str) -> None:
+        """清掉已经失效的流状态，避免字典跟着聊天流数量一直长。
+
+        - `_last_sent`：冷却已过的没用了
+        - `_daily`：日期翻篇的计数下次会被重置，旧条目没用了
+        - `_pending`：道谢窗口已经关掉的
+        """
+        cooldown = max(0, self.config.beg.cooldown_seconds)
+        for key in [k for k, t in self._last_sent.items() if now - t >= cooldown]:
+            self._last_sent.pop(key, None)
+        for key in [k for k, (d, _) in self._daily.items() if d != today]:
+            self._daily.pop(key, None)
+        for key in [k for k, deadline in self._pending.items() if now > deadline]:
+            self._pending.pop(key, None)
 
     async def _do_beg(self, kwargs: dict) -> tuple[bool, str]:
         """真正执行一次讨饭，Tool 和 Command 共用。"""
@@ -903,6 +932,7 @@ class BegPlugin(MaiBotPlugin):
         self._daily[stream_id] = (day, count + 1)
         if root.beg.thanks_window_seconds > 0:
             self._pending[stream_id] = now + root.beg.thanks_window_seconds
+        self._prune_state(now, day)
         self.ctx.logger.info("已发送收款码 stream=%s 今日第 %d 次", stream_id, count + 1)
         return True, f"已经伸手要过了，收款码发出去了（今日第 {count + 1} 次）。"
 
@@ -920,33 +950,38 @@ class BegPlugin(MaiBotPlugin):
             self.ctx.logger.error("账本读取失败，按空账本处理: %s", exc)
             self._ledger = []
 
-    def _write_json(self, path: Path | None, payload: Any, label: str) -> None:
-        """原子写：先写同目录临时文件，再 os.replace 换上去。
+    def _write_json(self, path: Path | None, payload: Any, label: str) -> bool:
+        """原子写：先写同目录临时文件，再 os.replace 换上去。返回是否写成功。
 
         账本是纯手工维护的唯一副本，直接覆盖时如果写到一半进程没了，
         留下的就是半个 JSON，那份数据真的救不回来。
         """
         if path is None:
-            return
+            return False
         tmp = path.with_name(path.name + ".tmp")
         try:
             tmp.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
             )
             os.replace(tmp, path)
+            return True
         except Exception as exc:
             self.ctx.logger.error("%s写入失败: %s", label, exc)
             try:
                 tmp.unlink(missing_ok=True)
             except Exception:
                 pass
+            return False
 
-    def _save_ledger(self) -> None:
-        self._write_json(
+    def _save_ledger(self) -> bool:
+        return self._write_json(
             self._ledger_path, {"version": 1, "records": self._ledger}, "账本"
         )
 
-    def _record_payment(self, amount: float, note: str, stream_id: str) -> dict[str, Any]:
+    def _record_payment(
+        self, amount: float, note: str, stream_id: str
+    ) -> dict[str, Any] | None:
+        """记一笔并落盘。写盘失败返回 None，内存里也一并退回。"""
         now = datetime.now()
         entry = {
             "date": now.date().isoformat(),
@@ -956,12 +991,58 @@ class BegPlugin(MaiBotPlugin):
             "stream": stream_id,
         }
         self._ledger.append(entry)
-        self._save_ledger()
+        if not self._save_ledger():
+            # 没写进磁盘就别留在内存里，否则这一轮统计会多出一笔、
+            # 重启后又消失，等于跟用户说了句假话。
+            self._ledger.pop()
+            return None
         return entry
+
+    @staticmethod
+    def _amount_of(row: dict[str, Any]) -> float:
+        """账本金额容错：手工改坏的一行按 0 算，别让整个统计崩掉。"""
+        try:
+            return float(row.get("amount") or 0)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _day_total(self, day: str) -> tuple[float, int]:
         rows = [r for r in self._ledger if str(r.get("date")) == day]
-        return round(sum(float(r.get("amount") or 0) for r in rows), 2), len(rows)
+        return round(sum(self._amount_of(r) for r in rows), 2), len(rows)
+
+    def _bucket_by_day(
+        self, start: date, span: int
+    ) -> tuple[list[tuple[str, int, float]], float, int]:
+        """按天聚合最近 `span` 天，账本只扫一遍。
+
+        原来是每一天各调一次 `_day_total`，等于 O(天数 × 笔数)；
+        这里改成一次扫描 + 一次按天回填，顺序仍是今天在前。
+        """
+        if span <= 0:
+            return [], 0.0, 0
+
+        wanted = {(start - timedelta(days=o)).isoformat() for o in range(span)}
+        agg: dict[str, list[float]] = {}
+        for row in self._ledger:
+            key = str(row.get("date") or "")
+            if key not in wanted:
+                continue
+            slot = agg.setdefault(key, [0, 0.0])
+            slot[0] += 1
+            slot[1] += self._amount_of(row)
+
+        buckets: list[tuple[str, int, float]] = []
+        total = 0.0
+        count = 0
+        for offset in range(span):
+            key = (start - timedelta(days=offset)).isoformat()
+            slot = agg.get(key)
+            if not slot:
+                continue
+            buckets.append((key, int(slot[0]), round(slot[1], 2)))
+            total += slot[1]
+            count += int(slot[0])
+        return buckets, round(total, 2), count
 
     async def _record_and_report(
         self,
@@ -1003,6 +1084,8 @@ class BegPlugin(MaiBotPlugin):
             )
 
         entry = self._record_payment(value, str(note or "").strip(), str(stream_id or ""))
+        if entry is None:
+            return False, "账本写不进去，这笔没记上。"
         today_total, today_count = self._day_total(date.today().isoformat())
         text = f"记下了 {value:.2f}{unit}，今天 {today_count} 笔共 {today_total:.2f}{unit}。"
         # 正好在讨饭窗口内就顺手道谢
@@ -1059,7 +1142,7 @@ class BegPlugin(MaiBotPlugin):
         }
 
         unit = self.config.ledger.currency
-        where = group_name or "这个群"
+        where = group_name or "当前会话"
         lines = [
             f"【记账确认 #{rec['id']}】",
             # 中文里别在「群里」中间断空格
@@ -1076,13 +1159,13 @@ class BegPlugin(MaiBotPlugin):
 
         self._approvals[rec["id"]] = rec
         self._save_approvals()
+        # 昵称和群名只出现在私聊正文里，不进日志：日志有可能被贴到外面去
         self.ctx.logger.info(
-            "记账待确认 #%s: %.2f%s stream=%s 来源=%s",
+            "记账待确认 #%s: %.2f%s stream=%s",
             rec["id"],
             rec["amount"],
             unit,
             rec["stream_id"],
-            rec["requester"],
         )
         return rec
 
@@ -1091,14 +1174,55 @@ class BegPlugin(MaiBotPlugin):
             return
         try:
             data = json.loads(self._approvals_path.read_text(encoding="utf-8"))
-            self._approval_seq = int(data.get("seq") or 0)
-            items = data.get("items") or {}
-            self._approvals = {
-                str(k): v for k, v in items.items() if isinstance(v, dict)
-            }
         except Exception as exc:
             self.ctx.logger.error("待确认记录读取失败，按空处理: %s", exc)
             self._approvals = {}
+            return
+
+        # 顶层不是对象（手工改坏、或者被别的工具重写过）就当空的，别让 on_load 崩掉
+        if not isinstance(data, dict):
+            self.ctx.logger.warning("待确认记录顶层不是对象，按空处理")
+            data = {}
+
+        # seq 单独容错：它坏了不该连累下面已经有效的记录
+        try:
+            self._approval_seq = int(data.get("seq") or 0)
+        except (TypeError, ValueError):
+            self._approval_seq = 0
+
+        items = data.get("items")
+        if not isinstance(items, dict):
+            items = {}
+
+        # 文件可能被手工改过、也可能是旧版本留下的：逐条补默认值，
+        # 免得 /待确认、/确认 里下标访问直接抛 KeyError 把命令打崩。
+        clean: dict[str, dict[str, Any]] = {}
+        dropped = 0
+        for key, raw in items.items():
+            if not isinstance(raw, dict):
+                dropped += 1
+                continue
+            try:
+                clean[str(key)] = {
+                    "id": str(raw.get("id") or key),
+                    "amount": float(raw.get("amount") or 0),
+                    "note": str(raw.get("note") or ""),
+                    "stream_id": str(raw.get("stream_id") or ""),
+                    "stream_name": str(raw.get("stream_name") or ""),
+                    "requester": str(raw.get("requester") or "有人"),
+                    "created": float(raw.get("created") or 0),
+                }
+            except (TypeError, ValueError):
+                dropped += 1
+        self._approvals = clean
+
+        # 编号必须大于现存所有记录，否则新记录会跟旧编号撞上、互相顶掉
+        for key in clean:
+            if key.isdigit():
+                self._approval_seq = max(self._approval_seq, int(key))
+
+        if dropped:
+            self.ctx.logger.warning("待确认记录里有 %d 条格式不对，已丢弃", dropped)
 
     def _save_approvals(self) -> None:
         self._write_json(
@@ -1157,7 +1281,7 @@ class BegPlugin(MaiBotPlugin):
             return None
 
         today = date.today()
-        grand = round(sum(float(r.get("amount") or 0) for r in self._ledger), 2)
+        grand = round(sum(self._amount_of(r) for r in self._ledger), 2)
         view: dict[str, Any] = {
             "kind": kind,
             "unit": self.config.ledger.currency,
@@ -1184,7 +1308,7 @@ class BegPlugin(MaiBotPlugin):
             rows = [r for r in self._ledger if str(r.get("date")) == value]
             view.update(
                 label=str(value),
-                total=round(sum(float(r.get("amount") or 0) for r in rows), 2),
+                total=round(sum(self._amount_of(r) for r in rows), 2),
                 count=len(rows),
                 rows=rows[-10:],
                 extra=max(0, len(rows) - 10),
@@ -1192,17 +1316,7 @@ class BegPlugin(MaiBotPlugin):
             return view
 
         span = int(value) if kind == "days" else self.config.ledger.recent_days
-        buckets: list[tuple[str, int, float]] = []
-        span_total = 0.0
-        span_count = 0
-        for offset in range(span):
-            key = (today - timedelta(days=offset)).isoformat()
-            day_total, day_count = self._day_total(key)
-            if day_count == 0:
-                continue
-            span_total += day_total
-            span_count += day_count
-            buckets.append((key, day_count, day_total))
+        buckets, span_total, span_count = self._bucket_by_day(today, span)
 
         if kind == "days":
             view.update(
@@ -1250,7 +1364,7 @@ class BegPlugin(MaiBotPlugin):
         for row in view["rows"]:
             note = f" {row.get('note')}" if row.get("note") else ""
             lines.append(
-                f"  {row.get('time')} {float(row.get('amount') or 0):.2f}{unit}{note}"
+                f"  {row.get('time')} {self._amount_of(row):.2f}{unit}{note}"
             )
         if view["extra"]:
             lines.append(f"  ……另有 {view['extra']} 笔")
