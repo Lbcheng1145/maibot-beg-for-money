@@ -357,17 +357,9 @@ class BegPlugin(MaiBotPlugin):
             "对方提到钱相关的事就调，别用文字推辞。调用后发一张收款码。"
             "同一段对话最多一次，别反复要。"
         ),
-        parameters=[
-            ToolParameterInfo(
-                name="stream_id",
-                param_type=ToolParamType.STRING,
-                description="当前聊天流 ID",
-                required=True,
-            ),
-        ],
     )
-    async def handle_beg(self, stream_id: str = "", **kwargs):
-        ok, message = await self._do_beg(stream_id, kwargs)
+    async def handle_beg(self, **kwargs):
+        ok, message = await self._do_beg(kwargs)
         return {"success": ok, "content": message}
 
     @Tool(
@@ -378,12 +370,6 @@ class BegPlugin(MaiBotPlugin):
         ),
         parameters=[
             ToolParameterInfo(
-                name="stream_id",
-                param_type=ToolParamType.STRING,
-                description="当前聊天流 ID",
-                required=True,
-            ),
-            ToolParameterInfo(
                 name="scope",
                 param_type=ToolParamType.STRING,
                 description="今天/昨天/全部/天数(如7)/日期(如2026-10-27)，不填为今天加最近几天",
@@ -391,9 +377,14 @@ class BegPlugin(MaiBotPlugin):
             ),
         ],
     )
-    async def handle_check_ledger(self, stream_id: str = "", scope: str = "", **kwargs):
+    async def handle_check_ledger(self, scope: str = "", **kwargs):
         if not self.config.plugin.enabled or not self.config.ledger.enabled:
             return {"success": False, "content": "账本功能没开，查不了。"}
+
+        # 查账同样是看营收，跟 /收款 走同一个开关
+        allowed, reason = self._check_admin(kwargs)
+        if not allowed:
+            return {"success": False, "content": reason}
 
         view = self._ledger_view(scope)
         if view is None:
@@ -419,12 +410,6 @@ class BegPlugin(MaiBotPlugin):
                 required=True,
             ),
             ToolParameterInfo(
-                name="stream_id",
-                param_type=ToolParamType.STRING,
-                description="当前聊天流 ID",
-                required=True,
-            ),
-            ToolParameterInfo(
                 name="note",
                 param_type=ToolParamType.STRING,
                 description="备注，可留空",
@@ -433,18 +418,16 @@ class BegPlugin(MaiBotPlugin):
         ],
     )
     async def handle_record_payment(
-        self, amount: float = 0, stream_id: str = "", note: str = "", **kwargs
+        self, amount: float = 0, note: str = "", **kwargs
     ):
-        # 只打键名不打值：这里要确认工具路径下宿主到底注入了什么，又不能把内容写进日志
-        self.ctx.logger.debug(
-            "record_payment kwargs 键=%s caller=%r",
-            sorted(kwargs),
-            self._caller_id(kwargs),
-        )
+        stream_id = await self._resolve_stream(kwargs)
+        if not stream_id:
+            return {"success": False, "content": "拿不到当前聊天流，这笔先记不了。"}
+
         ok, text = await self._record_and_report(
             amount,
             note,
-            self._resolve_stream(stream_id, kwargs),
+            stream_id,
             source="工具",
             is_admin=self._is_admin_caller(kwargs),
             kwargs=kwargs,
@@ -460,7 +443,7 @@ class BegPlugin(MaiBotPlugin):
         if not allowed:
             await self._reply(stream_id, reason)
             return False, reason, 1
-        ok, message = await self._do_beg(stream_id, kwargs)
+        ok, message = await self._do_beg(kwargs)
         if not ok:
             # 成功时收款码已经发出去了，失败时才需要补一句说明
             await self._reply(stream_id, message)
@@ -689,22 +672,49 @@ class BegPlugin(MaiBotPlugin):
     def _admin_ids(self) -> list[str]:
         return [str(x).strip() for x in (self.config.beg.admin_ids or []) if str(x).strip()]
 
-    @staticmethod
-    def _resolve_stream(tool_arg: str, kwargs: dict) -> str:
-        """决定消息发往哪个流。
+    async def _resolve_stream(self, kwargs: dict) -> str:
+        """找出这次操作该作用在哪个聊天流。拿不到可信来源就返回空串。
 
-        这里发的是真收款码，不能让模型一句参数就把码发到别的群去，所以按可信度排：
-        1. `kwargs["message"]["session_id"]` —— 宿主注入的当前会话，模型改不动
-        2. `kwargs["stream_id"]` —— 宿主注入的流 ID（形参同名时会先被捕获，这里只作兜底）
-        3. 模型自己填的 `stream_id` 参数 —— 只在上面都拿不到时用
+        这里发的是真收款码、写的是真账本，所以只认宿主注入的信息：
+        1. `message.session_id`（命令路径）
+        2. `kwargs["stream_id"]`（宿主注入时）
+        3. 用注入的 `chat_id` / `user_id` 反查宿主的流
+
+        模型自己填的 `stream_id` 一律不用——它没法证明自己属于当前会话。
+        拿不到可信来源时调用方要拒绝执行，而不是退回到模型给的值。
         """
         message = kwargs.get("message")
         if isinstance(message, dict):
             sid = str(message.get("session_id") or "").strip()
             if sid:
                 return sid
+
         injected = str(kwargs.get("stream_id") or "").strip()
-        return injected or str(tool_arg or "").strip()
+        if injected:
+            return injected
+
+        chat_id = str(kwargs.get("chat_id") or "").strip()
+        user_id = str(kwargs.get("user_id") or "").strip()
+        try:
+            session = None
+            if chat_id:
+                if user_id and chat_id == user_id:
+                    session = await self.ctx.chat.get_stream_by_user_id(user_id)
+                else:
+                    session = await self.ctx.chat.get_stream_by_group_id(chat_id)
+            elif user_id:
+                session = await self.ctx.chat.get_stream_by_user_id(user_id)
+
+            if isinstance(session, dict):
+                sid = str(
+                    session.get("stream_id") or session.get("session_id") or ""
+                ).strip()
+                if sid:
+                    return sid
+        except Exception as exc:
+            self.ctx.logger.warning("按注入的 chat_id 反查聊天流失败: %s", exc)
+
+        return ""
 
     def _is_admin_caller(self, kwargs: dict) -> bool:
         """只看名单，不看开关。用来区分「管理员自己记」和「群友要审批」。"""
@@ -775,15 +785,15 @@ class BegPlugin(MaiBotPlugin):
         except Exception as exc:
             self.ctx.logger.error("发送命令响应失败: %s", exc)
 
-    async def _do_beg(self, stream_id: str, kwargs: dict) -> tuple[bool, str]:
+    async def _do_beg(self, kwargs: dict) -> tuple[bool, str]:
         """真正执行一次讨饭，Tool 和 Command 共用。"""
         root = self.config
         if not root.plugin.enabled or not root.beg.enabled:
             return False, "讨饭功能已关闭。"
 
-        stream_id = self._resolve_stream(stream_id, kwargs)
+        stream_id = await self._resolve_stream(kwargs)
         if not stream_id:
-            return False, "缺少 stream_id，无法发送。"
+            return False, "拿不到当前聊天流，这次不发。"
 
         qr_path = str(root.beg.qr_image_path or "").strip()
         if not qr_path:

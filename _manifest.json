@@ -25,6 +25,7 @@
     "send.image",
     "send.forward",
     "chat.get_stream_by_user_id",
+    "chat.get_stream_by_group_id",
     "maisaka.proactive.trigger"
   ],
   "plugin_type": "game",
