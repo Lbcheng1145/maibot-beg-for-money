@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
 import time
 from datetime import date, datetime, timedelta
@@ -299,6 +300,8 @@ class BegPlugin(MaiBotPlugin):
         self._approvals: dict[str, dict[str, Any]] = {}
         self._approval_seq = 0
         self._approvals_path: Path | None = None
+        #: 持有后台任务强引用，避免 create_task 的返回值被 GC 掉导致道谢静默不触发
+        self._bg_tasks: set[asyncio.Task] = set()
         #: 账本文件路径与内存缓存
         self._ledger_path: Path | None = None
         self._ledger: list[dict[str, Any]] = []
@@ -435,7 +438,7 @@ class BegPlugin(MaiBotPlugin):
         ok, text = await self._record_and_report(
             amount,
             note,
-            stream_id,
+            self._resolve_stream(stream_id, kwargs),
             source="工具",
             is_admin=self._is_admin_caller(kwargs),
             kwargs=kwargs,
@@ -619,7 +622,12 @@ class BegPlugin(MaiBotPlugin):
         if _NEGATIVE_PATTERN.search(text):
             return {}
 
-        asyncio.create_task(self._fire_thanks(stream_id, reason=f"群友说：{text[:30]}"))
+        task = asyncio.create_task(
+            self._fire_thanks(stream_id, reason=f"群友说：{text[:30]}")
+        )
+        # 不持引用的话任务可能在执行前被 GC，道谢就静默丢了
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
         return {}
 
     async def _fire_thanks(self, stream_id: str, reason: str) -> bool:
@@ -670,6 +678,23 @@ class BegPlugin(MaiBotPlugin):
 
     def _admin_ids(self) -> list[str]:
         return [str(x).strip() for x in (self.config.beg.admin_ids or []) if str(x).strip()]
+
+    @staticmethod
+    def _resolve_stream(tool_arg: str, kwargs: dict) -> str:
+        """决定消息发往哪个流。
+
+        这里发的是真收款码，不能让模型一句参数就把码发到别的群去，所以按可信度排：
+        1. `kwargs["message"]["session_id"]` —— 宿主注入的当前会话，模型改不动
+        2. `kwargs["stream_id"]` —— 宿主注入的流 ID（形参同名时会先被捕获，这里只作兜底）
+        3. 模型自己填的 `stream_id` 参数 —— 只在上面都拿不到时用
+        """
+        message = kwargs.get("message")
+        if isinstance(message, dict):
+            sid = str(message.get("session_id") or "").strip()
+            if sid:
+                return sid
+        injected = str(kwargs.get("stream_id") or "").strip()
+        return injected or str(tool_arg or "").strip()
 
     def _is_admin_caller(self, kwargs: dict) -> bool:
         """只看名单，不看开关。用来区分「管理员自己记」和「群友要审批」。"""
@@ -738,7 +763,7 @@ class BegPlugin(MaiBotPlugin):
         if not root.plugin.enabled or not root.beg.enabled:
             return False, "讨饭功能已关闭。"
 
-        stream_id = str(stream_id or kwargs.get("stream_id") or "").strip()
+        stream_id = self._resolve_stream(stream_id, kwargs)
         if not stream_id:
             return False, "缺少 stream_id，无法发送。"
 
@@ -816,16 +841,31 @@ class BegPlugin(MaiBotPlugin):
             self.ctx.logger.error("账本读取失败，按空账本处理: %s", exc)
             self._ledger = []
 
-    def _save_ledger(self) -> None:
-        if self._ledger_path is None:
+    def _write_json(self, path: Path | None, payload: Any, label: str) -> None:
+        """原子写：先写同目录临时文件，再 os.replace 换上去。
+
+        账本是纯手工维护的唯一副本，直接覆盖时如果写到一半进程没了，
+        留下的就是半个 JSON，那份数据真的救不回来。
+        """
+        if path is None:
             return
+        tmp = path.with_name(path.name + ".tmp")
         try:
-            payload = {"version": 1, "records": self._ledger}
-            self._ledger_path.write_text(
+            tmp.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
             )
+            os.replace(tmp, path)
         except Exception as exc:
-            self.ctx.logger.error("账本写入失败: %s", exc)
+            self.ctx.logger.error("%s写入失败: %s", label, exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _save_ledger(self) -> None:
+        self._write_json(
+            self._ledger_path, {"version": 1, "records": self._ledger}, "账本"
+        )
 
     def _record_payment(self, amount: float, note: str, stream_id: str) -> dict[str, Any]:
         now = datetime.now()
@@ -981,15 +1021,11 @@ class BegPlugin(MaiBotPlugin):
             self._approvals = {}
 
     def _save_approvals(self) -> None:
-        if self._approvals_path is None:
-            return
-        try:
-            payload = {"seq": self._approval_seq, "items": self._approvals}
-            self._approvals_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
-            )
-        except Exception as exc:
-            self.ctx.logger.error("待确认记录写入失败: %s", exc)
+        self._write_json(
+            self._approvals_path,
+            {"seq": self._approval_seq, "items": self._approvals},
+            "待确认记录",
+        )
 
     def _purge_approvals(self) -> bool:
         """丢掉超时的待确认记录。返回是否有变动。"""

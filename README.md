@@ -19,6 +19,8 @@
 2. 在 WebUI 插件页启用，或重启麦麦
 3. 首次加载会自动生成 `config.toml`
 
+要求：MaiBot 1.3.x + maibot-plugin-sdk 2.16.x。SDK 下限写的是 2.16.0，因为插件用到的 `maibot_sdk.types`、`PluginConfigBase` 和 `ctx.maisaka.proactive` 这一组能力要到 2.16 才齐，更早的版本会直接 ImportError。
+
 ## 配置
 
 至少配这两项，否则讨饭不可用：
