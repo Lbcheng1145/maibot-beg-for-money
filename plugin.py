@@ -680,39 +680,64 @@ class BegPlugin(MaiBotPlugin):
     def _admin_ids(self) -> list[str]:
         return [str(x).strip() for x in (self.config.beg.admin_ids or []) if str(x).strip()]
 
+    async def _fetch_stream(self, fetch, arg: str, label: str) -> str:
+        """调一次反查，拿回 stream_id。查不到或出错返回空串。"""
+        if not arg:
+            return ""
+        try:
+            session = await fetch(arg)
+        except Exception as exc:
+            self.ctx.logger.warning("按%s反查聊天流失败(%s): %s", label, arg, exc)
+            return ""
+        sid = ""
+        if isinstance(session, dict):
+            sid = str(
+                session.get("stream_id") or session.get("session_id") or ""
+            ).strip()
+        self.ctx.logger.debug("反查流 %s=%r -> %r", label, arg, sid)
+        return sid
+
     async def _lookup_stream(self, kwargs: dict) -> str:
-        """用注入的 chat_id / user_id 反查宿主的流。查不到返回空串。"""
+        """用注入的 chat_id / user_id 反查宿主的流。查不到返回空串。
+
+        ⚠ 群聊里 `user_id` 是**发言人**，拿它查会查到那个人的私聊流，
+        把本该发到群里的消息发到私聊去。所以纯数字的 chat_id（群号）只按群查，
+        绝不退回 user_id。
+        """
         chat_id = str(kwargs.get("chat_id") or "").strip()
         user_id = str(kwargs.get("user_id") or "").strip()
-        try:
-            session = None
-            if chat_id:
-                if user_id and chat_id == user_id:
-                    session = await self.ctx.chat.get_stream_by_user_id(user_id)
-                else:
-                    session = await self.ctx.chat.get_stream_by_group_id(chat_id)
-            elif user_id:
-                session = await self.ctx.chat.get_stream_by_user_id(user_id)
 
-            if isinstance(session, dict):
-                return str(
-                    session.get("stream_id") or session.get("session_id") or ""
-                ).strip()
-        except Exception as exc:
-            self.ctx.logger.warning("按 chat_id 反查聊天流失败: %s", exc)
-        return ""
+        if chat_id.isdigit():
+            # 少数平台直接拿 QQ 号当会话 ID，这种情况按私聊查
+            if user_id and chat_id == user_id:
+                return await self._fetch_stream(
+                    self.ctx.chat.get_stream_by_user_id, user_id, "私聊"
+                )
+            return await self._fetch_stream(
+                self.ctx.chat.get_stream_by_group_id, chat_id, "群"
+            )
+
+        # 非数字：私聊或内部会话。先按群试（有些平台的 chat_id 直接就是流 ID），
+        # 查不到再按 user_id 查私聊流。
+        sid = await self._fetch_stream(
+            self.ctx.chat.get_stream_by_group_id, chat_id, "群"
+        )
+        if sid:
+            return sid
+        return await self._fetch_stream(
+            self.ctx.chat.get_stream_by_user_id, user_id, "私聊"
+        )
 
     async def _resolve_stream(self, kwargs: dict) -> str:
         """找出这次操作该作用在哪个聊天流。拿不到可信来源就返回空串。
 
-        工具路径的两个来源都可能被模型动过手脚：宿主构造 payload 时先把模型传的
-        arguments 原样放进去、仅当键缺失或为空才补上下文
-        （`component_query._build_tool_invocation_payload`），runner 也不按 schema
-        过滤就直接 `**kwargs` 递进来。所以这里不单信任何一方，而是让两边互证：
+        优先级：命令路径的 `message.session_id` → 反查结果 → 非数字 chat_id 兜底
+        → 注入的 `stream_id`。
 
-        - 只有 `stream_id`：用它
-        - 只有反查结果：用反查结果
-        - 两边都有但不一致：说明至少有一方被篡改，直接拒绝
+        宿主构造工具 payload 时先把模型传的 arguments 原样放进去、仅当键缺失或为空
+        才补上下文（`component_query._build_tool_invocation_payload`），所以
+        `stream_id` 未必是可信的当前流——QQ 私聊实测给的是机器人账号号，直接拿去
+        发会报「未找到聊天流」。因此优先用 `chat_id` / `user_id` 反查出来的真流。
         """
         message = kwargs.get("message")
         if isinstance(message, dict):
@@ -733,6 +758,13 @@ class BegPlugin(MaiBotPlugin):
                     resolved[:8],
                 )
             return resolved
+
+        # 兜底：chat_id 在 QQ 私聊里直接就是流 ID，而 stream_id 反而是机器人账号号。
+        chat_id = str(kwargs.get("chat_id") or "").strip()
+        if chat_id and not chat_id.isdigit():
+            self.ctx.logger.debug("反查全失败，改用 chat_id 当流 ID: %r", chat_id)
+            return chat_id
+
         return injected
 
     def _is_admin_caller(self, kwargs: dict) -> bool:
