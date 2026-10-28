@@ -71,7 +71,7 @@
 写进账本 → 在原群触发送谢
 ```
 
-管理员自己触发的记账不走这道手续，直接生效。待确认记录落盘在 `data/plugins/com.lbcheng1145.beg-for-money/approvals.json`，插件重载或重启都不会丢。
+管理员自己触发的记账不走这道手续，直接生效。待确认记录落盘在 `data/plugins/github.lbcheng1145.beg-for-money/approvals.json`，插件重载或重启都不会丢。
 
 ## 常见问题
 
@@ -92,7 +92,7 @@ QQ 会把「拒绝」这个词转成表情，管理员收到的命令就成了�
 
 ## 数据文件
 
-都在 `data/plugins/com.lbcheng1145.beg-for-money/` 下：
+都在 `data/plugins/github.lbcheng1145.beg-for-money/` 下：
 
 - `ledger.json` — 账本
 - `approvals.json` — 待确认的记账
