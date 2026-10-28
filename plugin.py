@@ -667,32 +667,21 @@ class BegPlugin(MaiBotPlugin):
             if uid:
                 return uid
 
-        return str(kwargs.get("user_id") or "").strip()
+        # ⚠ 工具路径不采信 kwargs["user_id"]：宿主只在键缺失时才补上下文，
+        # 模型自己带一个管理员的 user_id 就能压过注入值、让审批形同虚设。
+        # 插件侧无法区分这个值是注入的还是模型塞的，所以一律按「认不出」处理，
+        # 工具触发的记账会走审批（fail-closed）。管理员想直接记就用 /打赏 命令。
+        if str(kwargs.get("user_id") or "").strip():
+            self.ctx.logger.warning(
+                "工具参数里出现 user_id，无法确认来源，按非管理员处理"
+            )
+        return ""
 
     def _admin_ids(self) -> list[str]:
         return [str(x).strip() for x in (self.config.beg.admin_ids or []) if str(x).strip()]
 
-    async def _resolve_stream(self, kwargs: dict) -> str:
-        """找出这次操作该作用在哪个聊天流。拿不到可信来源就返回空串。
-
-        这里发的是真收款码、写的是真账本，所以只认宿主注入的信息：
-        1. `message.session_id`（命令路径）
-        2. `kwargs["stream_id"]`（宿主注入时）
-        3. 用注入的 `chat_id` / `user_id` 反查宿主的流
-
-        模型自己填的 `stream_id` 一律不用——它没法证明自己属于当前会话。
-        拿不到可信来源时调用方要拒绝执行，而不是退回到模型给的值。
-        """
-        message = kwargs.get("message")
-        if isinstance(message, dict):
-            sid = str(message.get("session_id") or "").strip()
-            if sid:
-                return sid
-
-        injected = str(kwargs.get("stream_id") or "").strip()
-        if injected:
-            return injected
-
+    async def _lookup_stream(self, kwargs: dict) -> str:
+        """用注入的 chat_id / user_id 反查宿主的流。查不到返回空串。"""
         chat_id = str(kwargs.get("chat_id") or "").strip()
         user_id = str(kwargs.get("user_id") or "").strip()
         try:
@@ -706,15 +695,44 @@ class BegPlugin(MaiBotPlugin):
                 session = await self.ctx.chat.get_stream_by_user_id(user_id)
 
             if isinstance(session, dict):
-                sid = str(
+                return str(
                     session.get("stream_id") or session.get("session_id") or ""
                 ).strip()
-                if sid:
-                    return sid
         except Exception as exc:
-            self.ctx.logger.warning("按注入的 chat_id 反查聊天流失败: %s", exc)
-
+            self.ctx.logger.warning("按 chat_id 反查聊天流失败: %s", exc)
         return ""
+
+    async def _resolve_stream(self, kwargs: dict) -> str:
+        """找出这次操作该作用在哪个聊天流。拿不到可信来源就返回空串。
+
+        工具路径的两个来源都可能被模型动过手脚：宿主构造 payload 时先把模型传的
+        arguments 原样放进去、仅当键缺失或为空才补上下文
+        （`component_query._build_tool_invocation_payload`），runner 也不按 schema
+        过滤就直接 `**kwargs` 递进来。所以这里不单信任何一方，而是让两边互证：
+
+        - 只有 `stream_id`：用它
+        - 只有反查结果：用反查结果
+        - 两边都有但不一致：说明至少有一方被篡改，直接拒绝
+        """
+        message = kwargs.get("message")
+        if isinstance(message, dict):
+            sid = str(message.get("session_id") or "").strip()
+            if sid:
+                return sid
+
+        injected = str(kwargs.get("stream_id") or "").strip()
+        resolved = await self._lookup_stream(kwargs)
+
+        if injected and resolved:
+            if injected != resolved:
+                self.ctx.logger.warning(
+                    "stream_id(%s…) 与 chat_id 反查结果(%s…) 不一致，疑似被篡改，已拒绝",
+                    injected[:8],
+                    resolved[:8],
+                )
+                return ""
+            return injected
+        return injected or resolved
 
     def _is_admin_caller(self, kwargs: dict) -> bool:
         """只看名单，不看开关。用来区分「管理员自己记」和「群友要审批」。"""
