@@ -349,12 +349,10 @@ class BegPlugin(MaiBotPlugin):
 
     @Tool(
         "beg_for_money",
-        brief_description="伸手要钱：有人提到请客、打钱、投喂、发红包、赏你、给你钱、请你吃饭时立刻调用",
+        brief_description="伸手要钱：对方提到请客、打钱、投喂、发红包、赏你时调用",
         detailed_description=(
-            "只要对方提到了钱相关的事——请客、打钱、投喂、发红包、赏你、给你转钱、"
-            "缺钱吗、要不要请你、我请你——就应该调用这个工具，不要用文字推辞或嘴硬拒绝。"
-            "调用后会发一张收款码（以聊天记录形式）。"
-            "同一段对话里最多用一次，别反复要。"
+            "对方提到钱相关的事就调，别用文字推辞。调用后发一张收款码。"
+            "同一段对话最多一次，别反复要。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -371,13 +369,9 @@ class BegPlugin(MaiBotPlugin):
 
     @Tool(
         "check_ledger",
-        brief_description="查打赏账本：有人问收到多少钱、今天收了多少、谁打过钱时调用",
+        brief_description="查打赏账本：有人问收到多少钱时调用",
         detailed_description=(
-            "查的是本机账本文件里真实记下的打赏，不是估算，也不是你的印象。"
-            "scope 可以不填（今天加最近几天加累计），也可以填：今天、昨天、全部、"
-            "天数（填 7 就是最近 7 天）、具体日期（2026-10-27 或 10-27）。"
-            "拿到数字后用自己的话简短说，别把明细一条条念出来。"
-            "只有对方真的在问收到多少钱时才调。"
+            "查本机账本的真实记录。拿到数字用自己的话简短说，别念明细。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -389,7 +383,7 @@ class BegPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="scope",
                 param_type=ToolParamType.STRING,
-                description="查询范围：今天 / 昨天 / 全部 / 天数（如 7）/ 日期（如 2026-10-27）。不填就是今天加最近几天",
+                description="今天/昨天/全部/天数(如7)/日期(如2026-10-27)，不填为今天加最近几天",
                 required=False,
             ),
         ],
@@ -409,20 +403,16 @@ class BegPlugin(MaiBotPlugin):
 
     @Tool(
         "record_payment",
-        brief_description="记一笔收到的打赏：对方明确说了打了多少钱时调用",
+        brief_description="记一笔打赏：对方明确说出金额时调用",
         detailed_description=(
-            "把一笔真收到的打赏记进账本。"
-            "只在对方明确说出金额时调用，比如「我转了15」「打了20过去」「扫了8块8」。"
-            "没给金额、开玩笑、说「下次一定」的都不要记。同一笔钱只记一次，别重复调。"
-            "如果返回说要等管理员确认，就在回复里表现出半信半疑，"
-            "比如「真的假的」「别糊弄我」「等我问问」，别直接道谢，也别再调一次。"
-            "如果返回说记下了，就正常说记上了。"
+            "只在对方说出具体金额时调，猜的、开玩笑的、没金额的都不记，同一笔只记一次。"
+            "返回要等管理员确认时，回一句半信半疑的话（真的假的/等我问问），别道谢也别重调。"
         ),
         parameters=[
             ToolParameterInfo(
                 name="amount",
                 param_type=ToolParamType.NUMBER,
-                description="金额，必须大于 0",
+                description="金额，大于 0",
                 required=True,
             ),
             ToolParameterInfo(
@@ -434,7 +424,7 @@ class BegPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="note",
                 param_type=ToolParamType.STRING,
-                description="备注，比如对方的昵称或原话，可留空",
+                description="备注，可留空",
                 required=False,
             ),
         ],
