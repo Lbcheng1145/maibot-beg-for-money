@@ -2,9 +2,10 @@
 config.toml
 config_back/
 
-# 本地素材（收款码等个人图片），不要提交
+# 本地素材：只保留图标，收款码等个人图片不进仓库
 assets/*
 !assets/.gitkeep
+!assets/icon.png
 
 # Python
 __pycache__/

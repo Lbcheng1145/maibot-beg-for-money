@@ -28,6 +28,13 @@
     "maisaka.proactive.trigger"
   ],
   "plugin_type": "extension",
+  "display": {
+    "icon": {
+      "type": "local",
+      "value": "assets/icon.png",
+      "background": "#F59E0B"
+    }
+  },
   "i18n": {
     "default_locale": "zh-CN"
   }
