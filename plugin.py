@@ -435,6 +435,12 @@ class BegPlugin(MaiBotPlugin):
     async def handle_record_payment(
         self, amount: float = 0, stream_id: str = "", note: str = "", **kwargs
     ):
+        # 只打键名不打值：这里要确认工具路径下宿主到底注入了什么，又不能把内容写进日志
+        self.ctx.logger.debug(
+            "record_payment kwargs 键=%s caller=%r",
+            sorted(kwargs),
+            self._caller_id(kwargs),
+        )
         ok, text = await self._record_and_report(
             amount,
             note,
@@ -647,10 +653,16 @@ class BegPlugin(MaiBotPlugin):
     # ---------------------------------------------------------------- 讨饭
 
     def _caller_id(self, kwargs: dict) -> str:
-        """尽量从命令/工具的 kwargs 里挖出调用者 QQ 号。挖不到返回空串。
+        """挖出调用者 QQ 号，只认宿主注入的位置。挖不到返回空串。
 
-        命令走 `message.message_info.user_info.user_id`，工具那边的载荷结构不一定一样，
-        所以多试几个位置，别只认一条路。
+        两条路径的实际载荷不一样：
+        - 命令：`kwargs["message"]["message_info"]["user_info"]["user_id"]`
+        - 工具：Runner 直接注入 `kwargs["user_id"]`（实测键为
+          `['chat_id', 'platform', 'user_id']`，没有 message）
+
+        工具声明的参数只有 amount / stream_id / note，模型无法通过 JSON schema
+        传别的键，所以 `kwargs["user_id"]` 不可能是伪造的。除此之外的
+        `sender_id` / `caller_id` 之类来源没有保证，一律不认。
         """
         message = kwargs.get("message")
         if isinstance(message, dict):
@@ -661,20 +673,18 @@ class BegPlugin(MaiBotPlugin):
                     uid = str(user.get("user_id") or "").strip()
                     if uid:
                         return uid
+
             sender = message.get("sender") or {}
             if isinstance(sender, dict):
                 uid = str(sender.get("user_id") or "").strip()
                 if uid:
                     return uid
+
             uid = str(message.get("user_id") or "").strip()
             if uid:
                 return uid
 
-        for key in ("user_id", "sender_id", "caller_id"):
-            uid = str(kwargs.get(key) or "").strip()
-            if uid:
-                return uid
-        return ""
+        return str(kwargs.get("user_id") or "").strip()
 
     def _admin_ids(self) -> list[str]:
         return [str(x).strip() for x in (self.config.beg.admin_ids or []) if str(x).strip()]
@@ -718,6 +728,14 @@ class BegPlugin(MaiBotPlugin):
                 gi = info.get("group_info") or {}
                 if isinstance(gi, dict):
                     group = str(gi.get("group_name") or "").strip()
+
+        # 工具路径没有 message，只能拿注入的 chat_id 当群标识，至少让管理员知道是哪个群
+        if not group:
+            chat_id = str(kwargs.get("chat_id") or "").strip()
+            uid = str(kwargs.get("user_id") or "").strip()
+            if chat_id and chat_id != uid:
+                group = f"群 {chat_id}"
+
         return self._caller_id(kwargs), name, group
 
     @staticmethod
@@ -939,7 +957,8 @@ class BegPlugin(MaiBotPlugin):
         ids = self._admin_ids()
         if not ids:
             return False
-        self.ctx.logger.debug("私聊管理员内容:\n%s", text)
+        # 正文里有群名和昵称，不写进日志，免得日志被分享出去时把群信息带出去
+        self.ctx.logger.debug("准备私聊 %d 个管理员", len(ids))
 
         delivered = 0
         for uid in ids:

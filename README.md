@@ -40,7 +40,7 @@
 | `beg.daily_limit` | `3` | 每个聊天流每天最多讨几次，`0` 表示不限 |
 | `beg.thanks_window_seconds` | `600` | 讨饭后多久内算「可能有人打钱」的窗口 |
 | `beg.thank_intent` | 见配置 | 触发道谢时交给 Planner 的意图 |
-| `beg.admin_only` | `false` | 开启后手动命令只给 `admin_ids` 用 |
+| `beg.admin_only` | `false` | 开启后手动命令只给 `admin_ids` 用。**也管 `/收款` 和 `check_ledger`**，见下方隐私说明 |
 | `ledger.enabled` | `true` | 记账总开关 |
 | `ledger.currency` | `元` | 金额单位 |
 | `ledger.recent_days` | `7` | `/收款` 默认展示最近几天 |
@@ -76,6 +76,9 @@
 管理员自己触发的记账不走这道手续，直接生效。待确认记录落盘在 `data/plugins/github.lbcheng1145.beg-for-money/approvals.json`，插件重载或重启都不会丢。
 
 ## 常见问题
+
+**别人能看到我收了多少吗？**
+`beg.admin_only` 默认是 `false`，意味着任何群友都能用 `/收款`，也能让模型调 `check_ledger` 查到收入汇总。不想公开营收就把它改成 `true`，此时 `/收款`、`/待确认`、`/确认`、`/不记` 都只认 `admin_ids` 里的人。
 
 **为什么记账不直接生效？**
 个人收款码没有到账回调，谁都能顺口说一句「我转了」。直接落账等于让任何人往账本里写数字，而账本是纯手工维护的，记错了只能改文件。所以群友触发的记账先挂成待确认。
