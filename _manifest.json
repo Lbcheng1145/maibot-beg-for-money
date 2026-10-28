@@ -1,0 +1,34 @@
+{
+  "manifest_version": 2,
+  "id": "com.lbcheng1145.beg-for-money",
+  "version": "1.0.0",
+  "name": "讨饭",
+  "description": "群友提到打钱时伸手要饭并发收款码，记账需管理员私聊确认，支持 LLM 自主调用。",
+  "author": {
+    "name": "Lbcheng1145",
+    "url": "https://github.com/Lbcheng1145"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/Lbcheng1145/maibot-beg-for-money"
+  },
+  "host_application": {
+    "min_version": "1.3.0",
+    "max_version": "1.3.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.16.99"
+  },
+  "capabilities": [
+    "send.text",
+    "send.image",
+    "send.forward",
+    "chat.get_stream_by_user_id",
+    "maisaka.proactive.trigger"
+  ],
+  "plugin_type": "extension",
+  "i18n": {
+    "default_locale": "zh-CN"
+  }
+}

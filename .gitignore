@@ -1,0 +1,18 @@
+# 运行期生成，含本机路径和 QQ 号，不要提交
+config.toml
+config_back/
+
+# 本地素材（收款码等个人图片），不要提交
+assets/*
+!assets/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
