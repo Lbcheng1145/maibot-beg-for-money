@@ -723,16 +723,17 @@ class BegPlugin(MaiBotPlugin):
         injected = str(kwargs.get("stream_id") or "").strip()
         resolved = await self._lookup_stream(kwargs)
 
-        if injected and resolved:
-            if injected != resolved:
+        # 以反查结果为准：私聊场景下宿主注入的 stream_id 可能就是账号号，
+        # 直接拿去发会报「未找到聊天流」；反查拿到的才是真实流。
+        if resolved:
+            if injected and injected != resolved:
                 self.ctx.logger.warning(
-                    "stream_id(%s…) 与 chat_id 反查结果(%s…) 不一致，疑似被篡改，已拒绝",
+                    "注入的 stream_id(%s…) 与反查(%s…) 不一致，以反查为准",
                     injected[:8],
                     resolved[:8],
                 )
-                return ""
-            return injected
-        return injected or resolved
+            return resolved
+        return injected
 
     def _is_admin_caller(self, kwargs: dict) -> bool:
         """只看名单，不看开关。用来区分「管理员自己记」和「群友要审批」。"""
